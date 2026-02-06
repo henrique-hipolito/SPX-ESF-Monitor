@@ -1,0 +1,24 @@
+version: '3.8'
+
+services:
+  spx-monitor:
+    build: .
+    container_name: spx-polymarket-monitor
+    restart: unless-stopped
+    environment:
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN}
+      - TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID}
+      - DATABASE_URL=${DATABASE_URL}
+      - CHECK_INTERVAL=${CHECK_INTERVAL:-60}
+      - HEARTBEAT_INTERVAL=${HEARTBEAT_INTERVAL:-1200}
+      - ESF_THRESHOLD_1M=${ESF_THRESHOLD_1M:-0.002}
+      - ESF_THRESHOLD_ACCUMULATED=${ESF_THRESHOLD_ACCUMULATED:-0.005}
+      - PM_THRESHOLD_PERCENT=${PM_THRESHOLD_PERCENT:-0.05}
+      - PM_THRESHOLD_CENTS=${PM_THRESHOLD_CENTS:-0.01}
+    networks:
+      - spx-network
+
+networks:
+  spx-network:
+    external: true
+    name: ${NETWORK_NAME:-bridge}
