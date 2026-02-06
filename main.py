@@ -308,17 +308,35 @@ class YahooFinanceAPI:
             logger.error(f"Erro ao buscar ES=F: {e}")
             return None
     
-    def get_spx_close(self) -> Optional[float]:
-        """Retorna fechamento do SPX"""
+    def get_latest_spx_close(self) -> Optional[float]:
+        """
+        Retorna o fechamento mais recente do SPX.
+        - Se o mercado já fechou hoje (após 16h ET), retorna o fechamento de hoje
+        - Se o mercado ainda não fechou, retorna o fechamento do dia anterior
+        """
         try:
+            now_et = datetime.now(ET_TIMEZONE)
             fast_info = self.spx_ticker.fast_info
+            
+            # Se é dia útil e depois das 16h, o mercado já fechou hoje
+            # Nesse caso, last_price é o fechamento de hoje
+            if now_et.weekday() < 5 and now_et.hour >= 16:
+                return float(fast_info.last_price)
+            
+            # Se é fim de semana, retorna o último fechamento (sexta)
+            if now_et.weekday() >= 5:
+                return float(fast_info.previous_close)
+            
+            # Se é dia útil antes das 16h, mercado ainda não fechou
+            # Retorna o fechamento do dia anterior
             return float(fast_info.previous_close)
+            
         except Exception as e:
-            logger.error(f"Erro ao buscar ^GSPC: {e}")
+            logger.error(f"Erro ao buscar fechamento ^GSPC: {e}")
             return None
     
     def get_spx_current_price(self) -> Optional[float]:
-        """Retorna preço atual do SPX (para capturar fechamento às 16h05)"""
+        """Retorna preço atual do SPX"""
         try:
             fast_info = self.spx_ticker.fast_info
             return float(fast_info.last_price)
@@ -426,45 +444,59 @@ class PolymarketAPI:
         return None
     
     def _parse_odds(self, data: list) -> Optional[dict]:
-        """Parse das odds do evento"""
+        """Parse das odds do evento SPX Up/Down (mercado binário)"""
         if not data or len(data) == 0:
             return None
         
         event = data[0]
         markets = event.get("markets", [])
         
-        up_price = None
-        down_price = None
+        if not markets:
+            return None
         
-        for market in markets:
-            if not market.get("active", False):
-                continue
-            
-            group_item = market.get("groupItemTitle", "").lower()
+        # Pegar o primeiro market ativo
+        market = None
+        for m in markets:
+            if m.get("active", False):
+                market = m
+                break
+        
+        if not market:
+            return None
+        
+        try:
+            # outcomes: ["Up", "Down"]
+            # outcomePrices: ["0.475", "0.525"]
+            outcomes = market.get("outcomes", "[]")
             outcomes_prices = market.get("outcomePrices", "[]")
             
-            try:
-                if isinstance(outcomes_prices, str):
-                    prices = json.loads(outcomes_prices)
-                else:
-                    prices = outcomes_prices
+            if isinstance(outcomes, str):
+                outcomes = json.loads(outcomes)
+            if isinstance(outcomes_prices, str):
+                outcomes_prices = json.loads(outcomes_prices)
+            
+            if len(outcomes) < 2 or len(outcomes_prices) < 2:
+                return None
+            
+            # Mapear outcomes para preços
+            up_price = None
+            down_price = None
+            
+            for i, outcome in enumerate(outcomes):
+                outcome_lower = outcome.lower()
+                if outcome_lower == "up":
+                    up_price = float(outcomes_prices[i])
+                elif outcome_lower == "down":
+                    down_price = float(outcomes_prices[i])
+            
+            if up_price is not None and down_price is not None:
+                return {
+                    'up_price': up_price,
+                    'down_price': down_price
+                }
                 
-                if len(prices) >= 1:
-                    yes_price = float(prices[0])
-                    
-                    if "up" in group_item:
-                        up_price = yes_price
-                    elif "down" in group_item:
-                        down_price = yes_price
-                        
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.warning(f"Erro ao parsear odds: {e}")
-        
-        if up_price is not None or down_price is not None:
-            return {
-                'up_price': up_price or 0.0,
-                'down_price': down_price or 0.0
-            }
+        except (json.JSONDecodeError, ValueError, IndexError) as e:
+            logger.warning(f"Erro ao parsear odds: {e}")
         
         return None
 
@@ -740,10 +772,10 @@ class SPXMonitor:
         
         # Buscar dados iniciais
         try:
-            # SPX Close
+            # SPX Close - pega o fechamento mais recente disponível
             self.current_spx_close = await self.db.get_latest_spx_close()
             if not self.current_spx_close:
-                self.current_spx_close = self.yahoo.get_spx_close()
+                self.current_spx_close = self.yahoo.get_latest_spx_close()
                 if self.current_spx_close:
                     await self.db.save_spx_close(SPXClose(
                         date=datetime.now(ET_TIMEZONE),
@@ -818,13 +850,13 @@ class SPXMonitor:
                 await asyncio.sleep(60)
     
     async def _close_capture_loop(self):
-        """Loop para capturar fechamento do SPX às 16h05 ET"""
+        """Loop para capturar fechamento do SPX às 16h01 ET"""
         while self.running:
             try:
                 now_et = datetime.now(ET_TIMEZONE)
                 
-                # Calcular próximo 16h05
-                target_time = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
+                # Calcular próximo 16h01
+                target_time = now_et.replace(hour=16, minute=1, second=0, microsecond=0)
                 if now_et >= target_time:
                     target_time += timedelta(days=1)
                 
