@@ -29,7 +29,8 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))  # 1 minuto
-HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "1200"))  # 20 minutos
+HEARTBEAT_INTERVAL = int(os.getenv("HEARTBEAT_INTERVAL", "1200"))  # 20 minutos (salvamento no banco)
+TELEGRAM_HEARTBEAT_INTERVAL = int(os.getenv("TELEGRAM_HEARTBEAT_INTERVAL", "43200"))  # 12 horas (notificação Telegram)
 
 # Thresholds ES=F
 ESF_THRESHOLD_1M = float(os.getenv("ESF_THRESHOLD_1M", "0.002"))  # 0.2% desde última medição
@@ -578,16 +579,22 @@ class TelegramBot:
     async def send_heartbeat(self, es_price: float, spx_close: float,
                               opens_odds: dict, closes_odds: dict,
                               uptime_hours: float, checks_count: int,
-                              polymarket: 'PolymarketAPI'):
+                              polymarket: 'PolymarketAPI', esf_status: str = ""):
         """Envia heartbeat"""
-        above_below = "acima" if es_price > spx_close else "abaixo"
-        change_pct = ((es_price - spx_close) / spx_close) * 100
-        
         lines = [
             "💓 <b>HEARTBEAT - SPX Monitor</b>\n",
-            f"📊 <b>ES=F:</b> {es_price:,.2f} ({above_below}, {change_pct:+.2f}%)",
-            f"📈 <b>SPX Close ref:</b> {spx_close:,.2f}\n",
         ]
+        
+        # Adicionar status do mercado ES=F
+        if esf_status:
+            lines.append(f"📡 <b>ES=F Status:</b> {esf_status}")
+        
+        # Mostrar dados do ES=F se disponíveis
+        if es_price and spx_close:
+            above_below = "acima" if es_price > spx_close else "abaixo"
+            change_pct = ((es_price - spx_close) / spx_close) * 100
+            lines.append(f"📊 <b>ES=F:</b> {es_price:,.2f} ({above_below}, {change_pct:+.2f}%)")
+            lines.append(f"📈 <b>SPX Close ref:</b> {spx_close:,.2f}\n")
         
         if opens_odds:
             lines.append(f"🎯 <b>Opens:</b> Up {opens_odds['up_price']*100:.1f}¢ | Down {opens_odds['down_price']*100:.1f}¢")
@@ -761,6 +768,34 @@ class SPXMonitor:
         self.last_opens_odds: Optional[dict] = None
         self.last_closes_odds: Optional[dict] = None
     
+    def _is_esf_trading_hours(self) -> bool:
+        """
+        Verifica se o ES=F está em horário de negociação.
+        ES=F negocia de domingo 18h ET até sexta 17h ET, com pausa diária 17h-18h.
+        Retorna False de sexta 18h ET até domingo 17h ET (fim de semana).
+        """
+        now_et = datetime.now(ET_TIMEZONE)
+        weekday = now_et.weekday()  # 0=segunda, 4=sexta, 5=sábado, 6=domingo
+        hour = now_et.hour
+        
+        # Sábado: sempre fechado
+        if weekday == 5:
+            return False
+        
+        # Domingo: fechado até 17h, abre às 18h
+        if weekday == 6:
+            return hour >= 18
+        
+        # Sexta: fecha às 17h, não reabre
+        if weekday == 4:
+            return hour < 17
+        
+        # Segunda a quinta: pausa das 17h às 18h
+        if 17 <= hour < 18:
+            return False
+        
+        return True
+    
     async def start(self):
         """Inicia o monitor"""
         logger.info("Iniciando SPX Monitor...")
@@ -820,6 +855,7 @@ class SPXMonitor:
         await asyncio.gather(
             self._check_loop(),
             self._heartbeat_loop(),
+            self._telegram_heartbeat_loop(),
             self._close_capture_loop(),
         )
         
@@ -838,25 +874,38 @@ class SPXMonitor:
                 await asyncio.sleep(30)
     
     async def _heartbeat_loop(self):
-        """Loop de heartbeat (20 min)"""
+        """Loop de heartbeat para salvamento no banco (20 min) - sem notificação Telegram"""
         while self.running:
             try:
                 await asyncio.sleep(HEARTBEAT_INTERVAL)
-                await self._send_heartbeat()
+                # Só salva no banco, não envia Telegram
+                # O salvamento é feito pelo _check_once com save_reason=time_interval
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Erro no heartbeat loop: {e}")
                 await asyncio.sleep(60)
     
+    async def _telegram_heartbeat_loop(self):
+        """Loop de heartbeat do Telegram (12h) - 24/7"""
+        while self.running:
+            try:
+                await asyncio.sleep(TELEGRAM_HEARTBEAT_INTERVAL)
+                await self._send_telegram_heartbeat()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Erro no telegram heartbeat loop: {e}")
+                await asyncio.sleep(60)
+    
     async def _close_capture_loop(self):
-        """Loop para capturar fechamento do SPX às 16h01 ET"""
+        """Loop para capturar fechamento do SPX às 16h05 ET"""
         while self.running:
             try:
                 now_et = datetime.now(ET_TIMEZONE)
                 
-                # Calcular próximo 16h01
-                target_time = now_et.replace(hour=16, minute=1, second=0, microsecond=0)
+                # Calcular próximo 16h05
+                target_time = now_et.replace(hour=16, minute=5, second=0, microsecond=0)
                 if now_et >= target_time:
                     target_time += timedelta(days=1)
                 
@@ -895,28 +944,29 @@ class SPXMonitor:
         self.checks_count += 1
         now = datetime.now(ET_TIMEZONE)
         
-        # 1. Verificar ES=F
-        es_price = self.yahoo.get_es_futures_price()
-        if es_price and self.current_spx_close:
-            self.last_es_price = es_price
-            
-            save_reason = self.es_detector.check(es_price, self.current_spx_close, now)
-            
-            if save_reason:
-                above_close = es_price > self.current_spx_close
-                change_pct = ((es_price - self.current_spx_close) / self.current_spx_close) * 100
+        # 1. Verificar ES=F (só durante horário de negociação)
+        if self._is_esf_trading_hours():
+            es_price = self.yahoo.get_es_futures_price()
+            if es_price and self.current_spx_close:
+                self.last_es_price = es_price
                 
-                await self.db.save_futures(ESFuturesData(
-                    timestamp=now,
-                    price=es_price,
-                    previous_close=self.current_spx_close,
-                    above_close=above_close,
-                    change_from_close_pct=change_pct,
-                    save_reason=save_reason
-                ))
-                logger.info(f"ES=F salvo: {es_price:.2f} ({save_reason.value})")
+                save_reason = self.es_detector.check(es_price, self.current_spx_close, now)
+                
+                if save_reason:
+                    above_close = es_price > self.current_spx_close
+                    change_pct = ((es_price - self.current_spx_close) / self.current_spx_close) * 100
+                    
+                    await self.db.save_futures(ESFuturesData(
+                        timestamp=now,
+                        price=es_price,
+                        previous_close=self.current_spx_close,
+                        above_close=above_close,
+                        change_from_close_pct=change_pct,
+                        save_reason=save_reason
+                    ))
+                    logger.info(f"ES=F salvo: {es_price:.2f} ({save_reason.value})")
         
-        # 2. Verificar Polymarket Opens
+        # 2. Verificar Polymarket Opens (24/7)
         opens_odds = await self.polymarket.fetch_opens_odds()
         if opens_odds:
             self.last_opens_odds = opens_odds
@@ -953,11 +1003,15 @@ class SPXMonitor:
             logger.info(f"Check #{self.checks_count} - ES=F: {es_price:.2f if es_price else 'N/A'}")
     
     async def _send_heartbeat(self):
-        """Envia heartbeat pro Telegram"""
-        if not self.last_es_price or not self.current_spx_close:
-            return
-        
+        """Heartbeat interno - não usado mais para Telegram"""
+        pass
+    
+    async def _send_telegram_heartbeat(self):
+        """Envia heartbeat pro Telegram a cada 12 horas"""
         uptime_hours = (datetime.now() - self.start_time).total_seconds() / 3600 if self.start_time else 0
+        
+        # Verificar se ES=F está em horário de negociação
+        esf_status = "🟢 Mercado aberto" if self._is_esf_trading_hours() else "🔴 Mercado fechado"
         
         await self.telegram.send_heartbeat(
             self.last_es_price,
@@ -966,8 +1020,10 @@ class SPXMonitor:
             self.last_closes_odds,
             uptime_hours,
             self.checks_count,
-            self.polymarket
+            self.polymarket,
+            esf_status
         )
+        logger.info(f"Telegram heartbeat enviado - Uptime: {uptime_hours:.1f}h")
     
     async def cleanup(self):
         """Limpa recursos"""
