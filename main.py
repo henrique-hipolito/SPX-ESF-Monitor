@@ -945,6 +945,7 @@ class SPXMonitor:
         now = datetime.now(ET_TIMEZONE)
         
         # 1. Verificar ES=F (só durante horário de negociação)
+        es_price = None
         if self._is_esf_trading_hours():
             es_price = self.yahoo.get_es_futures_price()
             if es_price and self.current_spx_close:
@@ -1000,7 +1001,8 @@ class SPXMonitor:
         
         # Log periódico
         if self.checks_count % 10 == 0:
-            logger.info(f"Check #{self.checks_count} - ES=F: {es_price:.2f if es_price else 'N/A'}")
+            es_price_str = f"{es_price:.2f}" if es_price else "mercado fechado"
+            logger.info(f"Check #{self.checks_count} - ES=F: {es_price_str}")
     
     async def _send_heartbeat(self):
         """Heartbeat interno - não usado mais para Telegram"""
