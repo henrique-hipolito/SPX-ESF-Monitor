@@ -18,7 +18,7 @@ import yfinance as yf
 
 # Configuração de logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,  # Temporariamente DEBUG para investigar problema do yfinance
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -304,7 +304,14 @@ class YahooFinanceAPI:
         """Retorna preço atual do ES=F"""
         try:
             fast_info = self.es_ticker.fast_info
-            return float(fast_info.last_price)
+            price = float(fast_info.last_price)
+            
+            # Log detalhado para debug
+            logger.debug(f"[YAHOO DEBUG] ES=F fast_info.last_price = {price}")
+            logger.debug(f"[YAHOO DEBUG] ES=F fast_info.previous_close = {fast_info.previous_close}")
+            logger.debug(f"[YAHOO DEBUG] ES=F fast_info.open = {fast_info.open}")
+            
+            return price
         except Exception as e:
             logger.error(f"Erro ao buscar ES=F: {e}")
             return None
@@ -318,6 +325,10 @@ class YahooFinanceAPI:
         try:
             now_et = datetime.now(ET_TIMEZONE)
             fast_info = self.spx_ticker.fast_info
+            
+            # Log detalhado para debug
+            logger.debug(f"[YAHOO DEBUG] ^GSPC fast_info.last_price = {fast_info.last_price}")
+            logger.debug(f"[YAHOO DEBUG] ^GSPC fast_info.previous_close = {fast_info.previous_close}")
             
             # Se é dia útil e depois das 16h, o mercado já fechou hoje
             # Nesse caso, last_price é o fechamento de hoje
@@ -340,7 +351,12 @@ class YahooFinanceAPI:
         """Retorna preço atual do SPX"""
         try:
             fast_info = self.spx_ticker.fast_info
-            return float(fast_info.last_price)
+            price = float(fast_info.last_price)
+            
+            # Log detalhado para debug
+            logger.debug(f"[YAHOO DEBUG] ^GSPC current fast_info.last_price = {price}")
+            
+            return price
         except Exception as e:
             logger.error(f"Erro ao buscar preço atual ^GSPC: {e}")
             return None
