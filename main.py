@@ -18,7 +18,7 @@ import yfinance as yf
 
 # Configuração de logging
 logging.basicConfig(
-    level=logging.DEBUG,  # Temporariamente DEBUG para investigar problema do yfinance
+    level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -306,14 +306,7 @@ class YahooFinanceAPI:
         try:
             ticker = yf.Ticker("ES=F")
             fast_info = ticker.fast_info
-            price = float(fast_info.last_price)
-            
-            # Log detalhado para debug
-            logger.debug(f"[YAHOO DEBUG] ES=F fast_info.last_price = {price}")
-            logger.debug(f"[YAHOO DEBUG] ES=F fast_info.previous_close = {fast_info.previous_close}")
-            logger.debug(f"[YAHOO DEBUG] ES=F fast_info.open = {fast_info.open}")
-            
-            return price
+            return float(fast_info.last_price)
         except Exception as e:
             logger.error(f"Erro ao buscar ES=F: {e}")
             return None
@@ -328,10 +321,6 @@ class YahooFinanceAPI:
             now_et = datetime.now(ET_TIMEZONE)
             ticker = yf.Ticker("^GSPC")
             fast_info = ticker.fast_info
-            
-            # Log detalhado para debug
-            logger.debug(f"[YAHOO DEBUG] ^GSPC fast_info.last_price = {fast_info.last_price}")
-            logger.debug(f"[YAHOO DEBUG] ^GSPC fast_info.previous_close = {fast_info.previous_close}")
             
             # Se é dia útil e depois das 16h, o mercado já fechou hoje
             # Nesse caso, last_price é o fechamento de hoje
@@ -355,12 +344,7 @@ class YahooFinanceAPI:
         try:
             ticker = yf.Ticker("^GSPC")
             fast_info = ticker.fast_info
-            price = float(fast_info.last_price)
-            
-            # Log detalhado para debug
-            logger.debug(f"[YAHOO DEBUG] ^GSPC current fast_info.last_price = {price}")
-            
-            return price
+            return float(fast_info.last_price)
         except Exception as e:
             logger.error(f"Erro ao buscar preço atual ^GSPC: {e}")
             return None
@@ -390,20 +374,54 @@ class PolymarketAPI:
         if self.session and not self.session.closed:
             await self.session.close()
     
-    def _get_target_trading_day(self) -> datetime:
-        """Retorna o próximo dia de trading relevante"""
-        now_et = datetime.now(ET_TIMEZONE)
-        
-        # Se é dia de semana e antes das 16h, o mercado é de hoje
-        if now_et.weekday() < 5 and now_et.hour < 16:
-            return now_et
-        
-        # Senão, próximo dia útil
-        target = now_et + timedelta(days=1)
+    def _get_next_trading_day(self, from_date: datetime) -> datetime:
+        """Retorna o próximo dia útil a partir de uma data"""
+        target = from_date + timedelta(days=1)
         while target.weekday() >= 5:  # Sábado ou Domingo
             target += timedelta(days=1)
-        
         return target
+    
+    def _get_target_opens_day(self) -> datetime:
+        """
+        Retorna o dia de trading relevante para o mercado Opens.
+        Opens resolve às 9:30 AM ET, então:
+        - Antes das 10h ET em dia útil → mercado é de hoje
+        - Depois das 10h ET em dia útil → mercado é do próximo dia útil
+        - Fim de semana → mercado é de segunda
+        """
+        now_et = datetime.now(ET_TIMEZONE)
+        
+        # Fim de semana → próximo dia útil
+        if now_et.weekday() >= 5:
+            return self._get_next_trading_day(now_et)
+        
+        # Dia útil antes das 10h → mercado é de hoje
+        if now_et.hour < 10:
+            return now_et
+        
+        # Dia útil depois das 10h → próximo dia útil
+        return self._get_next_trading_day(now_et)
+    
+    def _get_target_closes_day(self) -> datetime:
+        """
+        Retorna o dia de trading relevante para o mercado Closes.
+        Closes resolve às 16h ET, então:
+        - Antes das 16h30 ET em dia útil → mercado é de hoje
+        - Depois das 16h30 ET em dia útil → mercado é do próximo dia útil
+        - Fim de semana → mercado é de segunda
+        """
+        now_et = datetime.now(ET_TIMEZONE)
+        
+        # Fim de semana → próximo dia útil
+        if now_et.weekday() >= 5:
+            return self._get_next_trading_day(now_et)
+        
+        # Dia útil antes das 16h30 → mercado é de hoje
+        if now_et.hour < 16 or (now_et.hour == 16 and now_et.minute < 30):
+            return now_et
+        
+        # Dia útil depois das 16h30 → próximo dia útil
+        return self._get_next_trading_day(now_et)
     
     def _build_opens_slug(self, target_date: datetime) -> str:
         """Constrói o slug do evento Opens Up or Down"""
@@ -421,29 +439,33 @@ class PolymarketAPI:
     
     def get_opens_link(self) -> str:
         """Retorna link do mercado Opens"""
-        target = self._get_target_trading_day()
+        target = self._get_target_opens_day()
         slug = self._build_opens_slug(target)
         return f"https://polymarket.com/event/{slug}"
     
     def get_closes_link(self) -> str:
         """Retorna link do mercado Up or Down"""
-        target = self._get_target_trading_day()
+        target = self._get_target_closes_day()
         slug = self._build_closes_slug(target)
         return f"https://polymarket.com/event/{slug}"
     
-    def get_market_date(self) -> datetime:
-        """Retorna data do mercado atual"""
-        return self._get_target_trading_day()
+    def get_opens_market_date(self) -> datetime:
+        """Retorna data do mercado Opens atual"""
+        return self._get_target_opens_day()
+    
+    def get_closes_market_date(self) -> datetime:
+        """Retorna data do mercado Closes atual"""
+        return self._get_target_closes_day()
     
     async def fetch_opens_odds(self) -> Optional[dict]:
         """Busca odds do mercado Opens Up or Down"""
-        target = self._get_target_trading_day()
+        target = self._get_target_opens_day()
         slug = self._build_opens_slug(target)
         return await self._fetch_market_odds(slug)
     
     async def fetch_closes_odds(self) -> Optional[dict]:
         """Busca odds do mercado Up or Down (fechamento)"""
-        target = self._get_target_trading_day()
+        target = self._get_target_closes_day()
         slug = self._build_closes_slug(target)
         return await self._fetch_market_odds(slug)
     
@@ -641,8 +663,8 @@ class ESFuturesDetector:
         
         # Estado
         self.last_price: Optional[float] = None  # Última medição (1 min atrás)
-        self.last_saved_price: Optional[float] = None  # Último preço salvo no banco
-        self.last_saved_time: Optional[datetime] = None
+        self.last_saved_time: Optional[datetime] = None  # Para heartbeat
+        self.last_significant_price: Optional[float] = None  # Para variação acumulada (só reseta em movimento significativo)
         self.last_above_close: Optional[bool] = None
         
         # Anti-ruído
@@ -660,32 +682,31 @@ class ESFuturesDetector:
         # Primeira execução
         if self.first_run:
             self.last_price = current_price
-            self.last_saved_price = current_price
+            self.last_significant_price = current_price
             self.last_saved_time = current_time
             self.last_above_close = current_above_close
             self.first_run = False
             return SaveReason.INITIAL
         
         save_reason = None
+        is_significant_move = False  # Flag para saber se deve resetar last_significant_price
         
         # 1. Verificar cruzamento do fechamento
         if self.last_above_close is not None and current_above_close != self.last_above_close:
             save_reason = SaveReason.CROSSED_CLOSE
+            is_significant_move = True
             self._reset_suspect()
         
-        # 2. Verificar heartbeat (20 min desde último salvamento)
-        elif self.last_saved_time and (current_time - self.last_saved_time).total_seconds() >= HEARTBEAT_INTERVAL:
-            save_reason = SaveReason.TIME_INTERVAL
-            self._reset_suspect()
-        
-        # 3. Verificar variação acumulada desde último salvamento (0.5%)
-        elif self.last_saved_price:
-            change_accumulated = abs(current_price - self.last_saved_price) / self.last_saved_price
+        # 2. Verificar variação acumulada desde último movimento significativo (0.5%)
+        if save_reason is None and self.last_significant_price:
+            change_accumulated = abs(current_price - self.last_significant_price) / self.last_significant_price
             if change_accumulated >= self.threshold_accumulated:
                 save_reason = SaveReason.PRICE_CHANGE_ACCUMULATED
+                is_significant_move = True
                 self._reset_suspect()
+                logger.info(f"Variação acumulada: {self.last_significant_price:.2f} -> {current_price:.2f} ({change_accumulated*100:.2f}%)")
         
-        # 4. Verificar variação rápida (0.2% em 1 min) com confirmação anti-ruído
+        # 3. Verificar variação rápida (0.2% em 1 min) com confirmação anti-ruído
         if save_reason is None and self.last_price:
             change_1m = abs(current_price - self.last_price) / self.last_price
             
@@ -703,6 +724,7 @@ class ESFuturesDetector:
                         if change_from_baseline >= self.threshold_1m:
                             # Confirmado - não reverteu
                             save_reason = SaveReason.PRICE_CHANGE_1M
+                            is_significant_move = True
                             logger.info(f"Movimento confirmado: {self.suspect_baseline:.2f} -> {current_price:.2f} ({change_from_baseline*100:.2f}%)")
                         else:
                             logger.info(f"Movimento reverteu, descartando")
@@ -712,13 +734,21 @@ class ESFuturesDetector:
                 if self.suspect_price is not None:
                     self._reset_suspect()
         
+        # 4. Verificar heartbeat (20 min desde último salvamento)
+        if save_reason is None and self.last_saved_time:
+            if (current_time - self.last_saved_time).total_seconds() >= HEARTBEAT_INTERVAL:
+                save_reason = SaveReason.TIME_INTERVAL
+                # NÃO é movimento significativo - não reseta last_significant_price
+        
         # Atualizar estado
         self.last_price = current_price
         self.last_above_close = current_above_close
         
         if save_reason:
-            self.last_saved_price = current_price
             self.last_saved_time = current_time
+            # Só reseta referência de preço em movimentos significativos
+            if is_significant_move:
+                self.last_significant_price = current_price
         
         return save_reason
     
@@ -996,7 +1026,7 @@ class SPXMonitor:
             if should_save:
                 await self.db.save_polymarket_opens(PolymarketOdds(
                     timestamp=now,
-                    market_date=self.polymarket.get_market_date(),
+                    market_date=self.polymarket.get_opens_market_date(),
                     up_price=opens_odds['up_price'],
                     down_price=opens_odds['down_price'],
                     save_reason=reason
@@ -1012,7 +1042,7 @@ class SPXMonitor:
             if should_save:
                 await self.db.save_polymarket_closes(PolymarketOdds(
                     timestamp=now,
-                    market_date=self.polymarket.get_market_date(),
+                    market_date=self.polymarket.get_closes_market_date(),
                     up_price=closes_odds['up_price'],
                     down_price=closes_odds['down_price'],
                     save_reason=reason
