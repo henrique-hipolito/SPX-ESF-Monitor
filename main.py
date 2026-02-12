@@ -297,13 +297,15 @@ class YahooFinanceAPI:
     """Busca dados do Yahoo Finance"""
     
     def __init__(self):
-        self.es_ticker = yf.Ticker("ES=F")
-        self.spx_ticker = yf.Ticker("^GSPC")
+        # Não mantemos os tickers em cache - criamos novos a cada requisição
+        # para evitar dados stale (evidência: fast_info cacheia internamente)
+        pass
     
     def get_es_futures_price(self) -> Optional[float]:
         """Retorna preço atual do ES=F"""
         try:
-            fast_info = self.es_ticker.fast_info
+            ticker = yf.Ticker("ES=F")
+            fast_info = ticker.fast_info
             price = float(fast_info.last_price)
             
             # Log detalhado para debug
@@ -324,7 +326,8 @@ class YahooFinanceAPI:
         """
         try:
             now_et = datetime.now(ET_TIMEZONE)
-            fast_info = self.spx_ticker.fast_info
+            ticker = yf.Ticker("^GSPC")
+            fast_info = ticker.fast_info
             
             # Log detalhado para debug
             logger.debug(f"[YAHOO DEBUG] ^GSPC fast_info.last_price = {fast_info.last_price}")
@@ -350,7 +353,8 @@ class YahooFinanceAPI:
     def get_spx_current_price(self) -> Optional[float]:
         """Retorna preço atual do SPX"""
         try:
-            fast_info = self.spx_ticker.fast_info
+            ticker = yf.Ticker("^GSPC")
+            fast_info = ticker.fast_info
             price = float(fast_info.last_price)
             
             # Log detalhado para debug
