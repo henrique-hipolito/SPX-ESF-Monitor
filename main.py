@@ -8,12 +8,15 @@ import asyncio
 import aiohttp
 import json
 import os
-from datetime import datetime, timedelta, time
+import time
+from datetime import datetime, timedelta, time as dt_time
 from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List, Deque
+from collections import deque
 from enum import Enum
 import logging
+import math
 import yfinance as yf
 
 # Configuração de logging
@@ -39,6 +42,12 @@ ESF_THRESHOLD_ACCUMULATED = float(os.getenv("ESF_THRESHOLD_ACCUMULATED", "0.005"
 # Thresholds Polymarket
 PM_THRESHOLD_PERCENT = float(os.getenv("PM_THRESHOLD_PERCENT", "0.05"))  # 5%
 PM_THRESHOLD_CENTS = float(os.getenv("PM_THRESHOLD_CENTS", "0.01"))  # 1 centavo
+
+# Z-Score Detection Config
+ZSCORE_WINDOW_SIZE = int(os.getenv("ZSCORE_WINDOW_SIZE", "16"))  # Janela de 16 ticks
+ZSCORE_MIN_TICKS = int(os.getenv("ZSCORE_MIN_TICKS", "5"))  # Mínimo de 5 ticks para calcular
+ZSCORE_THRESHOLD = float(os.getenv("ZSCORE_THRESHOLD", "2.0"))  # Trigger em |z| >= 2.0
+ZSCORE_COOLDOWN_SECONDS = int(os.getenv("ZSCORE_COOLDOWN_SECONDS", "300"))  # 5 minutos de cooldown
 
 # Timezones
 ET_TIMEZONE = ZoneInfo("America/New_York")
@@ -79,6 +88,21 @@ class PolymarketOdds:
     up_price: float
     down_price: float
     save_reason: str = ""
+
+
+@dataclass
+class ZScoreTrigger:
+    """Dados de um trigger de z-score"""
+    trigger_ts: datetime
+    spx_price: float
+    z_score: float
+    price_delta: float
+    detect_lag_ms: int
+    poly_read_lag_ms: int
+    pm_up_t0: float
+    pm_dw_t0: float
+    pm_up_t1: Optional[float] = None
+    pm_dw_t1: Optional[float] = None
 
 
 # ============== DATABASE ==============
@@ -163,6 +187,24 @@ class Database:
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_spx_closes_date ON spx_closes(date)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_pm_opens_timestamp ON polymarket_opens(timestamp)')
             await conn.execute('CREATE INDEX IF NOT EXISTS idx_pm_closes_timestamp ON polymarket_closes(timestamp)')
+            
+            # Tabela de z-score triggers
+            await conn.execute('''
+                CREATE TABLE IF NOT EXISTS zscore_triggers (
+                    id SERIAL PRIMARY KEY,
+                    trigger_ts TIMESTAMPTZ NOT NULL,
+                    spx_price NUMERIC(10,2),
+                    z_score NUMERIC(8,4),
+                    price_delta NUMERIC(10,4),
+                    detect_lag_ms INTEGER,
+                    poly_read_lag_ms INTEGER,
+                    pm_up_t0 NUMERIC(6,4),
+                    pm_dw_t0 NUMERIC(6,4),
+                    pm_up_t1 NUMERIC(6,4),
+                    pm_dw_t1 NUMERIC(6,4)
+                )
+            ''')
+            await conn.execute('CREATE INDEX IF NOT EXISTS idx_zscore_trigger_ts ON zscore_triggers(trigger_ts)')
             
             logger.info("Tabelas criadas/verificadas")
     
@@ -290,6 +332,33 @@ class Database:
                     'timestamp': row['timestamp']
                 }
             return None
+    
+    async def save_zscore_trigger(self, data: 'ZScoreTrigger') -> Optional[int]:
+        """Salva um z-score trigger e retorna o ID"""
+        if not self.pool:
+            return None
+        
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow('''
+                INSERT INTO zscore_triggers 
+                (trigger_ts, spx_price, z_score, price_delta, detect_lag_ms, poly_read_lag_ms, pm_up_t0, pm_dw_t0)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                RETURNING id
+            ''', data.trigger_ts, data.spx_price, data.z_score, data.price_delta,
+                data.detect_lag_ms, data.poly_read_lag_ms, data.pm_up_t0, data.pm_dw_t0)
+            return row['id'] if row else None
+    
+    async def update_zscore_trigger_t1(self, trigger_id: int, pm_up_t1: float, pm_dw_t1: float):
+        """Atualiza um z-score trigger com os dados t+1"""
+        if not self.pool:
+            return
+        
+        async with self.pool.acquire() as conn:
+            await conn.execute('''
+                UPDATE zscore_triggers 
+                SET pm_up_t1 = $1, pm_dw_t1 = $2
+                WHERE id = $3
+            ''', pm_up_t1, pm_dw_t1, trigger_id)
 
 
 # ============== YAHOO FINANCE API ==============
@@ -794,6 +863,89 @@ class PolymarketDetector:
         return False, ""
 
 
+# ============== DETECTOR DE Z-SCORE ==============
+class ZScoreDetector:
+    """
+    Detecta movimentos anômalos no ES=F usando z-score.
+    Usa janela deslizante de 16 ticks para calcular média e desvio padrão dos deltas.
+    """
+    
+    def __init__(self, window_size: int = ZSCORE_WINDOW_SIZE, 
+                 min_ticks: int = ZSCORE_MIN_TICKS,
+                 threshold: float = ZSCORE_THRESHOLD,
+                 cooldown_seconds: int = ZSCORE_COOLDOWN_SECONDS):
+        self.window_size = window_size
+        self.min_ticks = min_ticks
+        self.threshold = threshold
+        self.cooldown_seconds = cooldown_seconds
+        
+        # Janela deslizante de preços
+        self.prices: Deque[float] = deque(maxlen=window_size + 1)  # +1 para calcular deltas
+        
+        # Cooldown
+        self.last_trigger_time: Optional[datetime] = None
+    
+    def add_price(self, price: float) -> Optional[dict]:
+        """
+        Adiciona um preço e verifica se há trigger.
+        Retorna dict com z_score e price_delta se trigger, None caso contrário.
+        """
+        self.prices.append(price)
+        
+        # Precisamos de pelo menos min_ticks + 1 preços para ter min_ticks deltas
+        if len(self.prices) < self.min_ticks + 1:
+            return None
+        
+        # Calcular deltas
+        deltas = []
+        prices_list = list(self.prices)
+        for i in range(1, len(prices_list)):
+            deltas.append(prices_list[i] - prices_list[i-1])
+        
+        if len(deltas) < self.min_ticks:
+            return None
+        
+        # Calcular estatísticas
+        current_delta = deltas[-1]
+        avg_delta = sum(deltas) / len(deltas)
+        
+        # Desvio padrão
+        variance = sum((d - avg_delta) ** 2 for d in deltas) / len(deltas)
+        stddev_delta = math.sqrt(variance)
+        
+        # Evitar divisão por zero
+        if stddev_delta == 0:
+            return None
+        
+        # Z-score
+        z_score = (current_delta - avg_delta) / stddev_delta
+        
+        # Verificar trigger
+        if abs(z_score) >= self.threshold:
+            # Verificar cooldown
+            if self.last_trigger_time:
+                elapsed = (datetime.now(ET_TIMEZONE) - self.last_trigger_time).total_seconds()
+                if elapsed < self.cooldown_seconds:
+                    logger.debug(f"Z-score trigger ignorado por cooldown ({elapsed:.0f}s < {self.cooldown_seconds}s)")
+                    return None
+            
+            # Trigger válido
+            self.last_trigger_time = datetime.now(ET_TIMEZONE)
+            return {
+                'z_score': z_score,
+                'price_delta': current_delta,
+                'avg_delta': avg_delta,
+                'stddev_delta': stddev_delta
+            }
+        
+        return None
+    
+    def reset(self):
+        """Reseta a janela de preços (útil no início de novo dia)"""
+        self.prices.clear()
+        # Não resetamos last_trigger_time para manter cooldown entre dias
+
+
 # ============== MONITOR PRINCIPAL ==============
 class SPXMonitor:
     """Monitor principal"""
@@ -807,6 +959,7 @@ class SPXMonitor:
         self.es_detector = ESFuturesDetector(ESF_THRESHOLD_1M, ESF_THRESHOLD_ACCUMULATED)
         self.opens_detector = PolymarketDetector(PM_THRESHOLD_PERCENT, PM_THRESHOLD_CENTS)
         self.closes_detector = PolymarketDetector(PM_THRESHOLD_PERCENT, PM_THRESHOLD_CENTS)
+        self.zscore_detector = ZScoreDetector()
         
         self.running = False
         self.start_time: Optional[datetime] = None
@@ -817,6 +970,9 @@ class SPXMonitor:
         self.last_es_price: Optional[float] = None
         self.last_opens_odds: Optional[dict] = None
         self.last_closes_odds: Optional[dict] = None
+        
+        # Z-score triggers pendentes (aguardando t+1)
+        self.pending_zscore_triggers: List[dict] = []  # [{trigger_id, trigger_time, ...}]
     
     def _is_esf_trading_hours(self) -> bool:
         """
@@ -982,6 +1138,7 @@ class SPXMonitor:
                     self.es_detector = ESFuturesDetector(ESF_THRESHOLD_1M, ESF_THRESHOLD_ACCUMULATED)
                     self.opens_detector = PolymarketDetector(PM_THRESHOLD_PERCENT, PM_THRESHOLD_CENTS)
                     self.closes_detector = PolymarketDetector(PM_THRESHOLD_PERCENT, PM_THRESHOLD_CENTS)
+                    self.zscore_detector.reset()
                 
             except asyncio.CancelledError:
                 break
@@ -993,9 +1150,11 @@ class SPXMonitor:
         """Executa uma verificação"""
         self.checks_count += 1
         now = datetime.now(ET_TIMEZONE)
+        t_cycle_start = time.perf_counter()
         
         # 1. Verificar ES=F (só durante horário de negociação)
         es_price = None
+        t_es_fetch_start = time.perf_counter()
         if self._is_esf_trading_hours():
             es_price = self.yahoo.get_es_futures_price()
             if es_price and self.current_spx_close:
@@ -1016,8 +1175,16 @@ class SPXMonitor:
                         save_reason=save_reason
                     ))
                     logger.info(f"ES=F salvo: {es_price:.2f} ({save_reason.value})")
+                
+                # Z-Score Detection
+                zscore_result = self.zscore_detector.add_price(es_price)
+                if zscore_result:
+                    t_detect = time.perf_counter()
+                    detect_lag_ms = int((t_detect - t_es_fetch_start) * 1000)
+                    await self._handle_zscore_trigger(es_price, zscore_result, now, detect_lag_ms)
         
         # 2. Verificar Polymarket Opens (24/7)
+        t_poly_start = time.perf_counter()
         opens_odds = await self.polymarket.fetch_opens_odds()
         if opens_odds:
             self.last_opens_odds = opens_odds
@@ -1035,6 +1202,7 @@ class SPXMonitor:
         
         # 3. Verificar Polymarket Closes
         closes_odds = await self.polymarket.fetch_closes_odds()
+        t_poly_end = time.perf_counter()
         if closes_odds:
             self.last_closes_odds = closes_odds
             should_save, reason = self.closes_detector.check(closes_odds['up_price'])
@@ -1049,10 +1217,120 @@ class SPXMonitor:
                 ))
                 logger.info(f"Closes odds salvo: Up {closes_odds['up_price']*100:.1f}¢ ({reason})")
         
+        # 4. Verificar triggers pendentes (t+1)
+        await self._check_pending_triggers()
+        
         # Log periódico
         if self.checks_count % 10 == 0:
             es_price_str = f"{es_price:.2f}" if es_price else "mercado fechado"
             logger.info(f"Check #{self.checks_count} - ES=F: {es_price_str}")
+    
+    async def _handle_zscore_trigger(self, es_price: float, zscore_result: dict, 
+                                      trigger_time: datetime, detect_lag_ms: int):
+        """Processa um z-score trigger"""
+        z_score = zscore_result['z_score']
+        price_delta = zscore_result['price_delta']
+        
+        # Buscar odds atuais do Polymarket
+        t_poly_start = time.perf_counter()
+        opens_odds = await self.polymarket.fetch_opens_odds()
+        closes_odds = await self.polymarket.fetch_closes_odds()
+        t_poly_end = time.perf_counter()
+        poly_read_lag_ms = int((t_poly_end - t_poly_start) * 1000)
+        
+        pm_up_t0 = closes_odds['up_price'] if closes_odds else 0
+        pm_dw_t0 = closes_odds['down_price'] if closes_odds else 0
+        
+        # Log de latência
+        logger.info(
+            f"[LATENCY_AUDIT] trigger_ts={trigger_time.isoformat()} "
+            f"detect_lag_ms={detect_lag_ms} poly_lag_ms={poly_read_lag_ms}"
+        )
+        
+        # Salvar no banco
+        trigger_data = ZScoreTrigger(
+            trigger_ts=trigger_time,
+            spx_price=es_price,
+            z_score=z_score,
+            price_delta=price_delta,
+            detect_lag_ms=detect_lag_ms,
+            poly_read_lag_ms=poly_read_lag_ms,
+            pm_up_t0=pm_up_t0,
+            pm_dw_t0=pm_dw_t0
+        )
+        
+        trigger_id = await self.db.save_zscore_trigger(trigger_data)
+        
+        if trigger_id:
+            # Adicionar à lista de pendentes para capturar t+1
+            self.pending_zscore_triggers.append({
+                'trigger_id': trigger_id,
+                'trigger_time': trigger_time,
+                'z_score': z_score,
+                'es_price': es_price,
+                'pm_up_t0': pm_up_t0
+            })
+        
+        # Enviar notificação Telegram
+        z_sign = "+" if z_score > 0 else ""
+        message = (
+            f"⚡ <b>Z-SCORE TRIGGER</b>\n\n"
+            f"📊 <b>ES=F:</b> {es_price:,.2f} | <b>Z:</b> {z_sign}{z_score:.2f}\n"
+            f"📈 <b>Delta:</b> {price_delta:+.2f} pts\n"
+            f"🎯 <b>PM Up:</b> {pm_up_t0*100:.1f}¢ → [aguardando t+1m]\n\n"
+            f"⏱ <b>Latência detecção:</b> {detect_lag_ms}ms\n"
+            f"⏱ <b>Latência PM read:</b> {poly_read_lag_ms}ms\n"
+            f"\n⏰ {trigger_time.strftime('%Y-%m-%d %H:%M:%S')} ET"
+        )
+        await self.telegram.send_message(message)
+        
+        logger.info(f"Z-Score trigger: Z={z_score:.2f}, ES={es_price:.2f}, delta={price_delta:.2f}")
+    
+    async def _check_pending_triggers(self):
+        """Verifica triggers pendentes e atualiza com t+1 se já passou 60s"""
+        if not self.pending_zscore_triggers:
+            return
+        
+        now = datetime.now(ET_TIMEZONE)
+        completed = []
+        
+        for pending in self.pending_zscore_triggers:
+            elapsed = (now - pending['trigger_time']).total_seconds()
+            
+            if elapsed >= 60:
+                # Buscar odds atuais
+                closes_odds = await self.polymarket.fetch_closes_odds()
+                
+                if closes_odds:
+                    pm_up_t1 = closes_odds['up_price']
+                    pm_dw_t1 = closes_odds['down_price']
+                    
+                    # Atualizar no banco
+                    await self.db.update_zscore_trigger_t1(
+                        pending['trigger_id'], pm_up_t1, pm_dw_t1
+                    )
+                    
+                    # Calcular variação
+                    pm_change = pm_up_t1 - pending['pm_up_t0']
+                    pm_change_sign = "+" if pm_change > 0 else ""
+                    
+                    # Enviar mensagem complementar
+                    message = (
+                        f"📊 <b>Z-SCORE T+1 UPDATE</b>\n\n"
+                        f"🎯 <b>PM Up:</b> {pending['pm_up_t0']*100:.1f}¢ → {pm_up_t1*100:.1f}¢ ({pm_change_sign}{pm_change*100:.1f}¢)\n"
+                        f"📈 <b>ES=F trigger:</b> {pending['es_price']:,.2f}\n"
+                        f"⚡ <b>Z-Score:</b> {pending['z_score']:.2f}\n"
+                        f"\n⏰ +60s from trigger"
+                    )
+                    await self.telegram.send_message(message)
+                    
+                    logger.info(f"Z-Score t+1: PM Up {pending['pm_up_t0']:.4f} -> {pm_up_t1:.4f}")
+                
+                completed.append(pending)
+        
+        # Remover os completados
+        for c in completed:
+            self.pending_zscore_triggers.remove(c)
     
     async def _send_heartbeat(self):
         """Heartbeat interno - não usado mais para Telegram"""
