@@ -49,6 +49,8 @@ ZSCORE_WINDOW_SIZE = int(os.getenv("ZSCORE_WINDOW_SIZE", "16"))  # Janela de 16 
 ZSCORE_MIN_TICKS = int(os.getenv("ZSCORE_MIN_TICKS", "5"))  # Mínimo de 5 ticks para calcular
 ZSCORE_THRESHOLD = float(os.getenv("ZSCORE_THRESHOLD", "2.0"))  # Trigger em |z| >= 2.0
 ZSCORE_COOLDOWN_SECONDS = int(os.getenv("ZSCORE_COOLDOWN_SECONDS", "300"))  # 5 minutos de cooldown
+ZSCORE_MIN_DELTA_POINTS = float(os.getenv("ZSCORE_MIN_DELTA_POINTS", "4.0"))
+ZSCORE_MIN_WINDOW_TICKS = int(os.getenv("ZSCORE_MIN_WINDOW_TICKS", "8"))
 ZSCORE_T1_DELAY_SECONDS = int(os.getenv("ZSCORE_T1_DELAY_SECONDS", "60"))  # 60 segundos para t+1
 
 # Timezones
@@ -771,11 +773,18 @@ class ZScoreDetector:
             return None
         current_delta = deltas[-1]
         avg_delta = sum(deltas) / len(deltas)
-        variance = sum((d - avg_delta) ** 2 for d in deltas) / len(deltas)
+        variance = sum((d - avg_delta) ** 2 for d in deltas) / (len(deltas) - 1)
         stddev_delta = math.sqrt(variance)
         if stddev_delta == 0:
             return None
         z_score = (current_delta - avg_delta) / stddev_delta
+        
+        if len(deltas) < ZSCORE_MIN_WINDOW_TICKS:
+            return None
+        if abs(current_delta) < ZSCORE_MIN_DELTA_POINTS:
+            logger.debug(f"Trigger cortado por delta insuficiente: {current_delta:.2f} pts (min={ZSCORE_MIN_DELTA_POINTS})")
+            return None
+
         if abs(z_score) >= self.threshold:
             if self.last_trigger_time:
                 elapsed = (datetime.now(ET_TIMEZONE) - self.last_trigger_time).total_seconds()
@@ -924,7 +933,7 @@ class SPXMonitor:
         pm_dw_t0 = closes_odds['down_price'] if closes_odds else 0
         pm_source = closes_odds.get('pm_source', 'rest_outcome_price') if closes_odds else 'rest_outcome_price'
         pm_snapshot_ts_t0 = closes_odds.get('pm_snapshot_ts') if closes_odds else None
-        detect_lag_ms = cycle_to_trigger_ms + es_fetch_ms
+        detect_lag_ms = cycle_to_trigger_ms
         poly_read_lag_ms = pm_t0_fetch_ms
         logger.info(f"[LATENCY_AUDIT] trigger_ts={trigger_ts.isoformat()} t_es_observed={t_es_observed_ts.isoformat()} "
                    f"t_pm_t0_read={t_pm_t0_read_ts.isoformat()} cycle_to_trigger_ms={cycle_to_trigger_ms} "
