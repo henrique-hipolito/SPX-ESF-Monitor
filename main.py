@@ -399,6 +399,53 @@ class Database:
                 SET pm_up_t1 = $1, pm_dw_t1 = $2, t_pm_t1_read_ts = $3, pm_t1_fetch_ms = $4, pm_snapshot_ts_t1 = $5
                 WHERE id = $6
             ''', pm_up_t1, pm_dw_t1, t_pm_t1_read_ts, pm_t1_fetch_ms, pm_snapshot_ts_t1, trigger_id)
+    
+    async def export_daily_csv(self, date: datetime) -> dict[str, bytes]:
+        """Exporta todas as tabelas do dia como CSVs em memória. Retorna dict {filename: bytes}"""
+        import io
+        import csv
+        if not self.pool:
+            return {}
+        date_str = date.strftime("%Y-%m-%d")
+        result = {}
+        queries = {
+            f"spx_futures_{date_str}.csv": """
+                SELECT * FROM spx_futures
+                WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = $1
+                ORDER BY timestamp
+            """,
+            f"polymarket_opens_{date_str}.csv": """
+                SELECT * FROM polymarket_opens
+                WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = $1
+                ORDER BY timestamp
+            """,
+            f"polymarket_closes_{date_str}.csv": """
+                SELECT * FROM polymarket_closes
+                WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = $1
+                ORDER BY timestamp
+            """,
+            f"zscore_triggers_{date_str}.csv": """
+                SELECT * FROM zscore_triggers
+                WHERE DATE(trigger_ts AT TIME ZONE 'America/New_York') = $1
+                ORDER BY trigger_ts
+            """,
+        }
+    
+        async with self.pool.acquire() as conn:
+            for filename, query in queries.items():
+                try:
+                    rows = await conn.fetch(query, date.date())
+                    if not rows:
+                        continue
+                    buf = io.StringIO()
+                    writer = csv.writer(buf)
+                    writer.writerow(rows[0].keys())
+                    writer.writerows([list(r.values()) for r in rows])
+                    result[filename] = buf.getvalue().encode("utf-8")
+                    logger.info(f"Export CSV: {filename} ({len(rows)} linhas)")
+                except Exception as e:
+                    logger.error(f"Erro ao exportar {filename}: {e}")
+        return result
 
 
 # ============== YAHOO FINANCE API ==============
@@ -567,6 +614,7 @@ class TelegramBot:
     """Envia mensagens pro Telegram"""
     
     API_URL = "https://api.telegram.org/bot{token}/sendMessage"
+    DOCUMENT_URL = "https://api.telegram.org/bot{token}/sendDocument"
     
     def __init__(self, token: str, chat_id: str):
         self.token = token
@@ -600,6 +648,31 @@ class TelegramBot:
                     return False
         except Exception as e:
             logger.error(f"Exceção ao enviar Telegram: {e}")
+            return False
+        
+    async def send_document(self, file_bytes: bytes, filename: str, caption: str = "") -> bool:
+        """Envia um arquivo para o Telegram"""
+        if not self.token or not self.chat_id:
+            logger.warning("Telegram não configurado, pulando envio de arquivo")
+            return False
+        session = await self.get_session()
+        url = self.DOCUMENT_URL.format(token=self.token)
+        try:
+            form = aiohttp.FormData()
+            form.add_field("chat_id", self.chat_id)
+            form.add_field("document", file_bytes, filename=filename, content_type="text/csv")
+            if caption:
+                form.add_field("caption", caption)
+            async with session.post(url, data=form) as response:
+                if response.status == 200:
+                    logger.info(f"Arquivo {filename} enviado pelo Telegram")
+                    return True
+                else:
+                    error = await response.text()
+                    logger.error(f"Erro ao enviar arquivo Telegram: {error}")
+                    return False
+        except Exception as e:
+            logger.error(f"Exceção ao enviar arquivo Telegram: {e}")
             return False
     
     async def send_startup_message(self, es_price: float, spx_close: float, opens_odds: dict, closes_odds: dict, polymarket: 'PolymarketAPI'):
@@ -863,6 +936,7 @@ class SPXMonitor:
             logger.info(f"Closes odds: {self.last_closes_odds}")
             await self.telegram.send_startup_message(self.last_es_price, self.current_spx_close,
                                                       self.last_opens_odds, self.last_closes_odds, self.polymarket)
+            await self._send_daily_export(datetime.now(ET_TIMEZONE))
         except Exception as e:
             logger.error(f"Erro na inicialização: {e}")
             return
@@ -1039,6 +1113,7 @@ class SPXMonitor:
                     self.opens_detector = PolymarketDetector(PM_THRESHOLD_PERCENT, PM_THRESHOLD_CENTS)
                     self.closes_detector = PolymarketDetector(PM_THRESHOLD_PERCENT, PM_THRESHOLD_CENTS)
                     self.zscore_detector.reset()
+                    await self._send_daily_export(datetime.now(ET_TIMEZONE))
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1084,6 +1159,29 @@ class SPXMonitor:
         await self.telegram.send_heartbeat(self.last_es_price, self.current_spx_close, self.last_opens_odds,
                                             self.last_closes_odds, uptime_hours, self.checks_count, self.polymarket, esf_status)
         logger.info(f"Telegram heartbeat enviado - Uptime: {uptime_hours:.1f}h")
+
+    async def _send_daily_export(self, export_date: datetime):
+        """Gera e envia os CSVs do dia pelo Telegram"""
+        logger.info(f"Iniciando export diário de {export_date.strftime('%Y-%m-%d')}")
+        csvs = await self.db.export_daily_csv(export_date)
+        if not csvs:
+            await self.telegram.send_message(f"📦 <b>Export diário {export_date.strftime('%Y-%m-%d')}</b>\n\nNenhum dado encontrado para exportar.")
+            return
+        total_files = len(csvs)
+        await self.telegram.send_message(
+            f"📦 <b>Export diário — {export_date.strftime('%Y-%m-%d')}</b>\n"
+            f"Enviando {total_files} arquivo(s)..."
+        )
+        for filename, file_bytes in csvs.items():
+            table_name = filename.split("_")[0] + "_" + filename.split("_")[1]
+            lines = file_bytes.decode("utf-8").count("\n") - 1
+            await self.telegram.send_document(
+                file_bytes=file_bytes,
+                filename=filename,
+                caption=f"📊 {table_name} — {lines} registro(s)"
+            )
+            await asyncio.sleep(1)  # evita flood no Telegram
+        logger.info(f"Export diário concluído: {total_files} arquivo(s) enviados")
     
     async def cleanup(self):
         await self.polymarket.close()
