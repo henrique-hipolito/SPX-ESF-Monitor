@@ -400,41 +400,50 @@ class Database:
                 WHERE id = $6
             ''', pm_up_t1, pm_dw_t1, t_pm_t1_read_ts, pm_t1_fetch_ms, pm_snapshot_ts_t1, trigger_id)
     
-    async def export_daily_csv(self, date: datetime) -> dict[str, bytes]:
-        """Exporta todas as tabelas do dia como CSVs em memória. Retorna dict {filename: bytes}"""
+    async def export_daily_csv(self, date: datetime, full_export: bool = False) -> dict[str, bytes]:
+        """Exporta tabelas como CSVs em memória. full_export=True exporta banco completo."""
         import io
         import csv
         if not self.pool:
             return {}
         date_str = date.strftime("%Y-%m-%d")
         result = {}
-        queries = {
-            f"spx_futures_{date_str}.csv": """
-                SELECT * FROM spx_futures
-                WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = $1
-                ORDER BY timestamp
-            """,
-            f"polymarket_opens_{date_str}.csv": """
-                SELECT * FROM polymarket_opens
-                WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = $1
-                ORDER BY timestamp
-            """,
-            f"polymarket_closes_{date_str}.csv": """
-                SELECT * FROM polymarket_closes
-                WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = $1
-                ORDER BY timestamp
-            """,
-            f"zscore_triggers_{date_str}.csv": """
-                SELECT * FROM zscore_triggers
-                WHERE DATE(trigger_ts AT TIME ZONE 'America/New_York') = $1
-                ORDER BY trigger_ts
-            """,
-        }
-    
+
+        if full_export:
+            queries = {
+                "spx_futures_completo.csv":       "SELECT * FROM spx_futures ORDER BY timestamp",
+                "polymarket_opens_completo.csv":  "SELECT * FROM polymarket_opens ORDER BY timestamp",
+                "polymarket_closes_completo.csv": "SELECT * FROM polymarket_closes ORDER BY timestamp",
+                "zscore_triggers_completo.csv":   "SELECT * FROM zscore_triggers ORDER BY trigger_ts",
+            }
+        else:
+            queries = {
+                f"spx_futures_{date_str}.csv": """
+                    SELECT * FROM spx_futures
+                    WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = $1
+                    ORDER BY timestamp
+                """,
+                f"polymarket_opens_{date_str}.csv": """
+                    SELECT * FROM polymarket_opens
+                    WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = $1
+                    ORDER BY timestamp
+                """,
+                f"polymarket_closes_{date_str}.csv": """
+                    SELECT * FROM polymarket_closes
+                    WHERE DATE(timestamp AT TIME ZONE 'America/New_York') = $1
+                    ORDER BY timestamp
+                """,
+                f"zscore_triggers_{date_str}.csv": """
+                    SELECT * FROM zscore_triggers
+                    WHERE DATE(trigger_ts AT TIME ZONE 'America/New_York') = $1
+                    ORDER BY trigger_ts
+                """,
+            }
+
         async with self.pool.acquire() as conn:
             for filename, query in queries.items():
                 try:
-                    rows = await conn.fetch(query, date.date())
+                    rows = await conn.fetch(query) if full_export else await conn.fetch(query, date.date())
                     if not rows:
                         continue
                     buf = io.StringIO()
@@ -615,6 +624,7 @@ class TelegramBot:
     
     API_URL = "https://api.telegram.org/bot{token}/sendMessage"
     DOCUMENT_URL = "https://api.telegram.org/bot{token}/sendDocument"
+    UPDATES_URL = "https://api.telegram.org/bot{token}/getUpdates"
     
     def __init__(self, token: str, chat_id: str):
         self.token = token
@@ -674,6 +684,24 @@ class TelegramBot:
         except Exception as e:
             logger.error(f"Exceção ao enviar arquivo Telegram: {e}")
             return False
+        
+    async def get_updates(self, offset: Optional[int] = None) -> list:
+        """Busca mensagens recebidas pelo bot"""
+        if not self.token:
+            return []
+        session = await self.get_session()
+        url = self.UPDATES_URL.format(token=self.token)
+        params = {"timeout": 5, "limit": 10}
+        if offset is not None:
+            params["offset"] = offset
+        try:
+            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=10)) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    return data.get("result", [])
+        except Exception as e:
+            logger.debug(f"Erro ao buscar updates Telegram: {e}")
+        return []
     
     async def send_startup_message(self, es_price: float, spx_close: float, opens_odds: dict, closes_odds: dict, polymarket: 'PolymarketAPI'):
         above_below = "acima" if es_price > spx_close else "abaixo"
@@ -936,7 +964,8 @@ class SPXMonitor:
             logger.info(f"Closes odds: {self.last_closes_odds}")
             await self.telegram.send_startup_message(self.last_es_price, self.current_spx_close,
                                                       self.last_opens_odds, self.last_closes_odds, self.polymarket)
-            await self._send_daily_export(datetime.now(ET_TIMEZONE))
+            yesterday_et = datetime.now(ET_TIMEZONE) - timedelta(days=1)
+            await self._send_daily_export(yesterday_et, full_export=True)
         except Exception as e:
             logger.error(f"Erro na inicialização: {e}")
             return
@@ -946,6 +975,7 @@ class SPXMonitor:
             self._heartbeat_loop(),
             self._telegram_heartbeat_loop(),
             self._close_capture_loop(),
+            self._telegram_commands_loop(),
         )
         await self.cleanup()
     
@@ -1113,7 +1143,7 @@ class SPXMonitor:
                     self.opens_detector = PolymarketDetector(PM_THRESHOLD_PERCENT, PM_THRESHOLD_CENTS)
                     self.closes_detector = PolymarketDetector(PM_THRESHOLD_PERCENT, PM_THRESHOLD_CENTS)
                     self.zscore_detector.reset()
-                    await self._send_daily_export(datetime.now(ET_TIMEZONE))
+                    await self._send_daily_export(datetime.now(ET_TIMEZONE), full_export=True)
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -1160,10 +1190,10 @@ class SPXMonitor:
                                             self.last_closes_odds, uptime_hours, self.checks_count, self.polymarket, esf_status)
         logger.info(f"Telegram heartbeat enviado - Uptime: {uptime_hours:.1f}h")
 
-    async def _send_daily_export(self, export_date: datetime):
+    async def _send_daily_export(self, export_date: datetime, full_export: bool = False):
         """Gera e envia os CSVs do dia pelo Telegram"""
         logger.info(f"Iniciando export diário de {export_date.strftime('%Y-%m-%d')}")
-        csvs = await self.db.export_daily_csv(export_date)
+        csvs = await self.db.export_daily_csv(export_date, full_export=full_export)
         if not csvs:
             await self.telegram.send_message(f"📦 <b>Export diário {export_date.strftime('%Y-%m-%d')}</b>\n\nNenhum dado encontrado para exportar.")
             return
@@ -1182,6 +1212,64 @@ class SPXMonitor:
             )
             await asyncio.sleep(1)  # evita flood no Telegram
         logger.info(f"Export diário concluído: {total_files} arquivo(s) enviados")
+
+    async def _telegram_commands_loop(self):
+        """Escuta comandos recebidos pelo bot no Telegram"""
+        offset = None
+        while self.running:
+            try:
+                updates = await self.telegram.get_updates(offset=offset)
+                for update in updates:
+                    offset = update["update_id"] + 1
+                    message = update.get("message", {})
+                    text = message.get("text", "").strip().lower()
+                    chat_id = str(message.get("chat", {}).get("id", ""))
+
+                    # Segurança: só responde ao chat configurado
+                    if chat_id != self.telegram.chat_id:
+                        continue
+
+                    if text == "/export_full":
+                        logger.info("Comando /export_full recebido")
+                        await self.telegram.send_message("⏳ Gerando export completo do banco...")
+                        await self._send_daily_export(datetime.now(ET_TIMEZONE), full_export=True)
+
+                    elif text == "/export_hoje":
+                        logger.info("Comando /export_hoje recebido")
+                        await self.telegram.send_message("⏳ Gerando export do dia...")
+                        await self._send_daily_export(datetime.now(ET_TIMEZONE), full_export=False)
+
+                    elif text == "/status":
+                        uptime_hours = (datetime.now() - self.start_time).total_seconds() / 3600 if self.start_time else 0
+                        esf_status = "🟢 Mercado aberto" if self._is_esf_trading_hours() else "🔴 Mercado fechado"
+                        es_str = f"{self.last_es_price:,.2f}" if self.last_es_price else "N/A"
+                        spx_str = f"{self.current_spx_close:,.2f}" if self.current_spx_close else "N/A"
+                        await self.telegram.send_message(
+                            f"📡 <b>Status do Bot</b>\n\n"
+                            f"{esf_status}\n"
+                            f"📊 ES=F: {es_str}\n"
+                            f"📈 SPX Close ref: {spx_str}\n"
+                            f"🔄 Verificações: {self.checks_count}\n"
+                            f"⚡ Z-score checks: {self.zscore_checks_count}\n"
+                            f"⏱ Uptime: {uptime_hours:.1f}h\n"
+                            f"⏰ {datetime.now(BR_TIMEZONE).strftime('%Y-%m-%d %H:%M:%S')} BRT"
+                        )
+
+                    elif text == "/help":
+                        await self.telegram.send_message(
+                            "🤖 <b>Comandos disponíveis</b>\n\n"
+                            "/export_full — Export completo do banco\n"
+                            "/export_hoje — Export só do dia atual\n"
+                            "/status — Status atual do bot\n"
+                            "/help — Esta mensagem"
+                        )
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Erro no telegram_commands_loop: {e}")
+
+            await asyncio.sleep(5)  # polling a cada 5 segundos
     
     async def cleanup(self):
         await self.polymarket.close()
